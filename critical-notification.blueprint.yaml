@@ -1,0 +1,201 @@
+blueprint:
+  name: Critical notifications
+  description: Sending critical notifications
+  domain: automation
+  # homeassistant:
+  #   min_version: ? #TODO
+  input:
+    sensors:
+      name: Seonsors
+      selector:
+        entity: # TODO try triggers once more
+          multiple: true
+          filter:
+            - domain: [binary_sensor, input_boolean]
+    todo_list:
+      name: To-do list
+      selector:
+        entity:
+          filter:
+            - domain: todo
+      # default: # TODO Not required
+    format_notification_action:
+      name: The action of converting the sensor status into a formatted notification 
+      selector:
+        action:
+      default:
+        - variables:
+            notification_label: >
+              {{ trigger_entity_attributes.friendly_name }}
+            is_notification_active: >
+              {{ trigger_entity_state == 'on' }}
+    stop_notifications_button: # TODO implement
+      name: The button to stop repeat actions
+      selector:
+        entity:
+          filter:
+            - domain: input_button
+    notification_actions:
+      name: One-time notification actions
+      selector:
+        action:
+    action_repeat_interval:
+      name: Interval between actions
+      selector:
+        duration:
+    repeat_notification_actions:
+      name: Repeatable notification actions
+      selector:
+        action:
+      default:
+        - action: persistent_notification.create
+          data:
+            title: Critical notification
+            notification_id: critical_notification
+            message: '{{ formated_all_notifications }}'
+mode: parallel
+max: 30
+triggers:
+  - trigger: event
+    id: todo_list_update
+    event_type: call_service
+    event_data:
+      domain: todo
+      service: add_item
+      service_data:
+        entity_id: [!input todo_list]
+  - trigger: event
+    id: todo_list_update
+    event_type: call_service
+    event_data:
+      domain: todo
+      service: remove_item
+      service_data:
+        entity_id: [!input todo_list]
+  - trigger: event
+    id: todo_list_update
+    event_type: call_service
+    event_data:
+      domain: todo
+      service: update_item
+      service_data:
+        entity_id: [!input todo_list]
+  - trigger: state
+    id: sensors_update
+    entity_id: !input sensors
+actions:
+  - event: critical_notification_start
+  - if:
+    - condition: trigger
+      id: [todo_list_update]
+    then:
+      # TODO Risk of missing the critical_notification_start event
+      - delay:
+          milliseconds: 100
+  - action: todo.get_items
+    metadata: {}
+    data:
+      status:
+        - needs_action
+        - completed
+    target:
+      entity_id: !input todo_list
+    response_variable: todo_items_response
+  - variables:
+      todo_list_entity_id: !input todo_list
+      all_notification: >
+        {{ todo_items_response[todo_list_entity_id]['items'] | list }}
+  - choose:
+    - conditions:
+        - condition: trigger
+          id: [sensors_update]
+      sequence:
+        - variables:
+            trigger_entity_id: >
+              {{trigger.entity_id}}
+            trigger_entity_state: >
+              {{trigger.to_state.state}}
+            trigger_entity_attributes: >
+              {{trigger.to_state.attributes}}
+        - sequence: !input format_notification_action
+        - variables:
+            has_notification_in_list: >
+              {{ all_notification | selectattr('summary', '==', notification_label) | first is defined }}
+        - choose:
+          - conditions:
+            - condition: template
+              value_template: '{{ is_notification_active == true }}'
+            sequence:
+              - if:
+                - condition: template
+                  value_template: >
+                    {{ not has_notification_in_list }}
+                then:
+                  - action: todo.add_item
+                    target:
+                      entity_id: !input todo_list
+                    data:
+                      item: '{{ notification_label }}'
+          - conditions:
+            - condition: template
+              value_template: '{{ is_notification_active == false }}'
+            sequence:
+              # - if:
+              #   - condition: template
+              #     value_template: >
+              #       {{ has_notification_in_list }}
+              #   then:
+                  - action: todo.remove_item
+                    target:
+                      entity_id: !input todo_list
+                    data:
+                      item: '{{ notification_label }}'
+                    continue_on_error: true
+    - conditions:
+        - condition: trigger
+          id: [todo_list_update]
+      sequence:
+        - variables:
+            can_repeat_actions: true
+        - parallel:
+            - sequence:
+                - variables:
+                    active_notifications: >
+                      {{ all_notification | selectattr('status', '==', 'needs_action') | list }}
+                    disabled_notifications: >
+                      {{ all_notification | selectattr('status', '==', 'completed') | list }}
+                    has_active_notification_to_display: >
+                      {{ active_notifications | length > 0 }}
+                    has_any_notification_to_display: >
+                      {{ all_notification | length > 0 }}
+                    formated_all_notifications: >
+                      {%- macro display_notifications_by_status(list, marker) -%}
+                        {{ list | map(attribute='summary') | map('regex_replace', '^', marker + ' ') | join('\n') }}
+                      {%- endmacro -%}
+
+                      {{- display_notifications_by_status(active_notifications, '⚠️') -}}
+                      {%- if (active_notifications and disabled_notifications) -%}
+                        {{- '\n' -}} 
+                      {% endif %}
+                      {{- display_notifications_by_status(disabled_notifications, '🔕') -}}
+                - if:
+                    - condition: template
+                      value_template: '{{ has_any_notification_to_display == true }}'
+                  then:
+                    - repeat:
+                        while:
+                          - condition: template
+                            value_template: '{{ can_repeat_actions }}'
+                        sequence:
+                          - sequence: !input repeat_notification_actions
+                          - wait_for_trigger:
+                              - trigger: event
+                                event_type: critical_notification_start
+                            timeout: !input action_repeat_interval
+                            continue_on_timeout: true
+            - sequence:
+                - wait_for_trigger:
+                    - trigger: event
+                      event_type: critical_notification_start
+                - variables:
+                    can_repeat_actions: false
