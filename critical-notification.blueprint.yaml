@@ -28,8 +28,8 @@ blueprint:
           filter:
             - domain: todo
       # default: # TODO Not required
-    stop_notifications_button: # TODO implement
-      name: The button to stop repeat actions
+    deactivate_notifications_button: # TODO implement
+      name: The button to deactivate all active notifications
       selector:
         entity:
           filter:
@@ -49,6 +49,13 @@ blueprint:
       name: Interval between actions
       selector:
         duration:
+    action_repeat_condition:
+      name: The condition for starting and continuing repeats of actions
+      selector:
+        condition:
+      default:
+        - condition: template
+          value_template: "{{ computed_notifications.with_todo_list.has_critical == true }}"
     repeat_notification_actions:
       name: Repeatable notification actions
       selector:
@@ -59,7 +66,7 @@ blueprint:
           enabled: false
           data:
             title: Critical notification
-            message: "{{ computed_notifications.without_todo_list.formatted_all }}"
+            message: "{{ computed_notifications.with_todo_list.formatted_all }}"
 mode: parallel
 max: 30
 triggers:
@@ -90,9 +97,12 @@ triggers:
   - trigger: state
     id: sensors_update
     entity_id: !input sensors
-  - trigger: homeassistant
-    id: homeassistant_start
-    event: start
+  - trigger: state
+    id: deactivate_notifications_button_pressed
+    entity_id: [!input deactivate_notifications_button]
+  # - trigger: homeassistant
+  #   id: homeassistant_start
+  #   event: start
 actions:
   - event: critical_notification_start
   - if:
@@ -248,9 +258,8 @@ actions:
                           'formatted_all': format_all_notifications(ref.critical_objects, ref.deactivated_objects, 'label'),
                         }
                       } }}
-                - if:
-                    - condition: template
-                      value_template: "{{ notifications_without_todo_list.has_any == true }}"
+                - sequence: !input onetime_notification_actions
+                - if: !input action_repeat_condition
                   then:
                     - repeat:
                         while:
@@ -264,8 +273,22 @@ actions:
                             timeout: !input action_repeat_interval
                             continue_on_timeout: true
             - sequence:
-                - wait_for_trigger:
+                - wait_for_trigger: # TODO All the steps have completed, but the automation continues to wait for the event.
                     - trigger: event
                       event_type: critical_notification_start
                 - variables:
                     can_repeat_actions: false
+    - conditions:
+        - condition: trigger
+          id: [deactivate_notifications_button_pressed]
+      sequence:
+        # TODO Should deactivate all notifications or only for entity states?
+        - repeat:
+            for_each: "{{ todo_list_items | selectattr('status', '==', 'needs_action') | list }}"
+            sequence:
+              - action: todo.update_item
+                target:
+                  entity_id: !input todo_list
+                data:
+                  status: completed
+                  item: "{{repeat.item.uid}}"
