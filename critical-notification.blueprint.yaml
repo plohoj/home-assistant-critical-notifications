@@ -6,12 +6,21 @@ blueprint:
   #   min_version: ? #TODO
   input:
     sensors:
-      name: Seonsors
+      name: Sensors
       selector:
         entity: # TODO try triggers once more
           multiple: true
           filter:
             - domain: [binary_sensor, input_boolean]
+    format_notification_action:
+      name: The action of converting the sensor state into a formatted notification 
+      selector:
+        action:
+      default:
+        - variables:
+            notification_state:
+              label: "{{ state_attr(sensor_entity_id, 'friendly_name') }}"
+              is_active: "{{ states(sensor_entity_id) == 'on' }}"
     todo_list:
       name: To-do list
       selector:
@@ -19,26 +28,23 @@ blueprint:
           filter:
             - domain: todo
       # default: # TODO Not required
-    format_notification_action:
-      name: The action of converting the sensor status into a formatted notification 
-      selector:
-        action:
-      default:
-        - variables:
-            notification_label: >
-              {{ trigger_entity_attributes.friendly_name }}
-            is_notification_active: >
-              {{ trigger_entity_state == 'on' }}
     stop_notifications_button: # TODO implement
       name: The button to stop repeat actions
       selector:
         entity:
           filter:
             - domain: input_button
-    notification_actions:
+    onetime_notification_actions:
       name: One-time notification actions
       selector:
         action:
+      default:
+        - action: persistent_notification.create
+          enabled: false
+          data:
+            title: Critical notification
+            notification_id: critical_notification
+            message: "{{ computed_notifications.with_todo_list.formatted_all }}"
     action_repeat_interval:
       name: Interval between actions
       selector:
@@ -48,11 +54,12 @@ blueprint:
       selector:
         action:
       default:
-        - action: persistent_notification.create
+        - action: notify.send_message
+          alias: Example of periodic notification sending (use your own sending action)
+          enabled: false
           data:
             title: Critical notification
-            notification_id: critical_notification
-            message: '{{ formated_all_notifications }}'
+            message: "{{ computed_notifications.without_todo_list.formatted_all }}"
 mode: parallel
 max: 30
 triggers:
@@ -83,6 +90,9 @@ triggers:
   - trigger: state
     id: sensors_update
     entity_id: !input sensors
+  - trigger: homeassistant
+    id: homeassistant_start
+    event: start
 actions:
   - event: critical_notification_start
   - if:
@@ -103,54 +113,54 @@ actions:
     response_variable: todo_items_response
   - variables:
       todo_list_entity_id: !input todo_list
-      all_notification: >
-        {{ todo_items_response[todo_list_entity_id]['items'] | list }}
+      todo_list_items: "{{ todo_items_response[todo_list_entity_id]['items'] | list }}"
+      notifications_states: []
+  - repeat:
+      for_each: !input sensors
+      sequence:
+        - variables:
+            sensor_entity_id: "{{ repeat.item }}"
+        - sequence: !input format_notification_action
+        - variables:
+            notifications_states: >
+              {{ notifications_states + [{
+                'sensor_entity_id': repeat.item,
+                'label': notification_state.label,
+                'is_active': notification_state.is_active,
+              }] }}
   - choose:
     - conditions:
         - condition: trigger
           id: [sensors_update]
       sequence:
-        - variables:
-            trigger_entity_id: >
-              {{trigger.entity_id}}
-            trigger_entity_state: >
-              {{trigger.to_state.state}}
-            trigger_entity_attributes: >
-              {{trigger.to_state.attributes}}
-        - sequence: !input format_notification_action
-        - variables:
-            has_notification_in_list: >
-              {{ all_notification | selectattr('summary', '==', notification_label) | first is defined }}
-        - choose:
-          - conditions:
-            - condition: template
-              value_template: '{{ is_notification_active == true }}'
+        - repeat:
+            for_each: "{{ notifications_states }}"
             sequence:
-              - if:
-                - condition: template
-                  value_template: >
-                    {{ not has_notification_in_list }}
-                then:
-                  - action: todo.add_item
-                    target:
-                      entity_id: !input todo_list
-                    data:
-                      item: '{{ notification_label }}'
-          - conditions:
-            - condition: template
-              value_template: '{{ is_notification_active == false }}'
-            sequence:
-              # - if:
-              #   - condition: template
-              #     value_template: >
-              #       {{ has_notification_in_list }}
-              #   then:
-                  - action: todo.remove_item
-                    target:
-                      entity_id: !input todo_list
-                    data:
-                      item: '{{ notification_label }}'
-                    continue_on_error: true
+              - variables:
+                  notification_state: "{{repeat.item}}"
+                  has_notification_state_label_in_todo_list: >
+                    {{ todo_list_items | selectattr('summary', '==', notification_state.label) | first is defined }}
+              - choose:
+                - conditions:
+                  - condition: template
+                    value_template: >
+                      {{ notification_state.is_active == true and not has_notification_state_label_in_todo_list }}
+                  sequence:
+                    - action: todo.add_item
+                      target:
+                        entity_id: !input todo_list
+                      data:
+                        item: "{{ notification_state.label }}"
+                - conditions:
+                  - condition: template
+                    value_template: >
+                      {{ notification_state.is_active == false and has_notification_state_label_in_todo_list }}
+                  sequence:
+                    - action: todo.remove_item
+                      target:
+                        entity_id: !input todo_list
+                      data:
+                        item: "{{ notification_state.label }}"
     - conditions:
         - condition: trigger
           id: [todo_list_update]
@@ -159,33 +169,93 @@ actions:
             can_repeat_actions: true
         - parallel:
             - sequence:
-                - variables:
-                    active_notifications: >
-                      {{ all_notification | selectattr('status', '==', 'needs_action') | list }}
-                    disabled_notifications: >
-                      {{ all_notification | selectattr('status', '==', 'completed') | list }}
-                    has_active_notification_to_display: >
-                      {{ active_notifications | length > 0 }}
-                    has_any_notification_to_display: >
-                      {{ all_notification | length > 0 }}
-                    formated_all_notifications: >
-                      {%- macro display_notifications_by_status(list, marker) -%}
-                        {{ list | map(attribute='summary') | map('regex_replace', '^', marker + ' ') | join('\n') }}
-                      {%- endmacro -%}
+                # state → {sensor_entity_id, label, is_active}
+                # todo → {summary, uid, status}
+                # object → {label, notification_state?, todo_list_item}
 
-                      {{- display_notifications_by_status(active_notifications, '⚠️') -}}
-                      {%- if (active_notifications and disabled_notifications) -%}
-                        {{- '\n' -}} 
-                      {% endif %}
-                      {{- display_notifications_by_status(disabled_notifications, '🔕') -}}
+                # Keep the order the same as in the TODO list
+                - variables:
+                    computed_notifications: >
+                      {% macro build_object_macro(todo_item, state_item, returns) %}
+                        {% if state_item is defined %}
+                          {% do returns({
+                            'label': todo_item.summary,
+                            'notification_state': state_item,
+                            'todo_list_item': todo_item,
+                          }) %}
+                        {% else %}
+                          {% do returns({
+                            'label': todo_item.summary,
+                            'todo_list_item': todo_item,
+                          }) %}
+                        {% endif %}
+                      {% endmacro %}
+                      {% set build_object = build_object_macro | as_function %}
+
+                      {% macro format_all_notifications_macro(critical_objects, deactivated_objects, attribute_name, returns) %}
+                        {% do returns(
+                          (critical_objects | map(attribute=attribute_name) | map('regex_replace', '^', '⚠️ ') | list
+                            + deactivated_objects | map(attribute=attribute_name) | map('regex_replace', '^', '🔕 ') | list
+                          ) | join('\n')
+                        ) %}
+                      {% endmacro %}
+                      {% set format_all_notifications = format_all_notifications_macro | as_function %}
+
+                      {% set ref = namespace({
+                        'critical_states': [],
+                        'deactivated_states': [],
+                        'critical_objects': [],
+                        'deactivated_objects': [],
+                      }) %}
+                      {% set active_states = notifications_states | selectattr('is_active', '==', true) | list %}
+
+                      {% for todo_item in todo_list_items %}
+                        {% set state_item = active_states | selectattr('label', '==', todo_item.summary) | first %}
+                        {% if todo_item['status'] == 'completed' %}
+                          {% if state_item is defined %}
+                            {% set ref.deactivated_states = ref.deactivated_states + [state_item] %}
+                            {% set ref.deactivated_objects = ref.deactivated_objects + [build_object(todo_item, state_item)] %}
+                          {% else %}
+                            {% set ref.deactivated_objects = ref.deactivated_objects + [build_object(todo_item, state_item)] %}
+                          {% endif %}
+                        {% else %}
+                          {% if state_item is defined %}
+                            {% set ref.critical_states = ref.critical_states + [state_item] %}
+                            {% set ref.critical_objects = ref.critical_objects + [build_object(todo_item, state_item)] %}
+                          {% else %}
+                            {% set ref.critical_objects = ref.critical_objects + [build_object(todo_item, state_item)] %}
+                          {% endif %}
+                        {% endif %}
+                      {% endfor %}
+
+                      {% set has_critical_states = ref.critical_states | first is defined %}
+                      {% set has_critical_objects = ref.critical_objects | first is defined %}
+
+                      {{ {
+                        'active_notification_states': active_states,
+                        'without_todo_list': {
+                          'deactivated': ref.deactivated_states,
+                          'critical': ref.critical_states,
+                          'has_critical': has_critical_states,
+                          'has_any': has_critical_states or ref.deactivated_states | first is defined,
+                          'formatted_all': format_all_notifications(ref.critical_states, ref.deactivated_states, 'label'),
+                        },
+                        'with_todo_list': {
+                          'deactivated': ref.deactivated_objects,
+                          'critical': ref.critical_objects,
+                          'has_critical': has_critical_objects,
+                          'has_any': has_critical_objects or ref.deactivated_objects | first is defined,
+                          'formatted_all': format_all_notifications(ref.critical_objects, ref.deactivated_objects, 'label'),
+                        }
+                      } }}
                 - if:
                     - condition: template
-                      value_template: '{{ has_any_notification_to_display == true }}'
+                      value_template: "{{ notifications_without_todo_list.has_any == true }}"
                   then:
                     - repeat:
                         while:
                           - condition: template
-                            value_template: '{{ can_repeat_actions }}'
+                            value_template: "{{ can_repeat_actions }}"
                         sequence:
                           - sequence: !input repeat_notification_actions
                           - wait_for_trigger:
